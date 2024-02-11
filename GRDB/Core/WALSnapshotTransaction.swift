@@ -3,11 +3,13 @@
 ///
 /// `WALSnapshotTransaction` **takes ownership** of its reader
 /// `SerializedDatabase` (TODO: make it a move-only type eventually).
-class WALSnapshotTransaction {
+final class WALSnapshotTransaction: @unchecked Sendable {
+    // @unchecked because `release` is protected by `reader`.
+    
+    private let reader: SerializedDatabase
+    
     // nil when closed
-    private var reader: SerializedDatabase?
-    // nil when closed
-    private var release: ((_ isInsideTransaction: Bool) -> Void)?
+    private var release: (@Sendable (_ isInsideTransaction: Bool) -> Void)?
     
     /// The state of the database at the beginning of the transaction.
     let walSnapshot: WALSnapshot
@@ -38,7 +40,7 @@ class WALSnapshotTransaction {
     ///   is no longer used.
     init(
         onReader reader: SerializedDatabase,
-        release: @escaping (_ isInsideTransaction: Bool) -> Void)
+        release: @escaping @Sendable (_ isInsideTransaction: Bool) -> Void)
     throws
     {
         assert(reader.configuration.readonly)
@@ -54,7 +56,7 @@ class WALSnapshotTransaction {
             self.release = release
         } catch {
             // self is not initialized, so deinit will not run.
-            Self.commitAndRelease(reader: reader, release: release)
+            Self.commitAndRelease(reader: reader, release: { _ in release })
             throw error
         }
     }
@@ -66,46 +68,55 @@ class WALSnapshotTransaction {
     /// Executes database operations in the snapshot transaction, and
     /// returns their result after they have finished executing.
     func read<T>(_ value: (Database) throws -> T) throws -> T {
-        guard let reader else {
-            throw DatabaseError.snapshotIsLost()
-        }
-        
         // We should check the validity of the snapshot, as DatabaseSnapshotPool does.
-        return try reader.sync(value)
+        return try reader.sync { db in
+            if release == nil /* closed? */ {
+                throw DatabaseError.snapshotIsLost()
+            }
+            
+            return try value(db)
+        }
     }
     
     /// Schedules database operations for execution, and
     /// returns immediately.
     func asyncRead(_ value: @escaping @Sendable (Result<Database, Error>) -> Void) {
-        guard let reader else {
-            value(.failure(DatabaseError.snapshotIsLost()))
-            return
-        }
-        
         // We should check the validity of the snapshot, as DatabaseSnapshotPool does.
         reader.async { db in
-            value(.success(db))
+            if self.release == nil /* closed? */ {
+                value(.failure(DatabaseError.snapshotIsLost()))
+            } else {
+                value(.success(db))
+            }
         }
     }
     
     func close() {
-        guard let reader, let release else { return }
-        self.reader = nil
-        self.release = nil
-        Self.commitAndRelease(reader: reader, release: release)
+        Self.commitAndRelease(reader: reader) { _ in
+            let release = self.release
+            // Commit and close only once!
+            self.release = nil
+            return release
+        }
     }
     
+    // Commits and release iff the `release` argument returns a non-nil closure.
     private static func commitAndRelease(
         reader: SerializedDatabase,
-        release: (_ isInsideTransaction: Bool) -> Void)
+        release: (Database) -> ((_ isInsideTransaction: Bool) -> Void)?)
     {
         // WALSnapshotTransaction may be deinitialized in the dispatch
         // queue of its reader: allow reentrancy.
-        let isInsideTransaction = reader.reentrantSync(allowingLongLivedTransaction: false) { db in
-            try? db.commit()
-            return db.isInsideTransaction
+        let (r, isInsideTransaction) = reader.reentrantSync(allowingLongLivedTransaction: false) { db in
+            let r = release(db)
+            
+            // Only commit if not released yet
+            if r != nil {
+                try? db.commit()
+            }
+            return (r, db.isInsideTransaction)
         }
-        release(isInsideTransaction)
+        r?(isInsideTransaction)
     }
 }
 #endif
